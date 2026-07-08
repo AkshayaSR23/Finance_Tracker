@@ -27,6 +27,7 @@ def get_connection():
     return conn
 
 
+@st.cache_resource
 def initialize_database():
     conn = get_connection()
     cursor = conn.cursor()
@@ -35,6 +36,19 @@ def initialize_database():
         CREATE TABLE IF NOT EXISTS users(
             username TEXT PRIMARY KEY,
             password TEXT
+        )
+    """)
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions(
+            token TEXT PRIMARY KEY,
+            username TEXT,
+            created_at TEXT
         )
     """)
 
@@ -60,10 +74,22 @@ def initialize_database():
         )
     """)
 
+    # Per-user data isolation: each expense/history row now belongs to a
+    # user. One-time cleanup: old rows predate this and were test data,
+    # so we clear them out instead of migrating (clean slate, not tied
+    # to any account).
+    cursor.execute("PRAGMA table_info(expenses)")
+    if "username" not in [r[1] for r in cursor.fetchall()]:
+        cursor.execute("DELETE FROM history")
+        cursor.execute("DELETE FROM expenses")
+        cursor.execute("ALTER TABLE expenses ADD COLUMN username TEXT")
+        cursor.execute("ALTER TABLE history ADD COLUMN username TEXT")
+
     cursor.execute("""
         INSERT OR IGNORE INTO users(username,password)
         VALUES('admin','admin123')
     """)
+    cursor.execute("UPDATE users SET email='admin@example.com' WHERE username='admin' AND (email IS NULL OR email='')")
 
     # Per-user editable monthly budget — added as a column on the
     # existing users table (no new table), persists across sessions.
@@ -78,6 +104,8 @@ def initialize_database():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_expense_id ON history(expense_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_date ON history(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_category ON history(category)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_username ON history(username)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_expenses_username ON expenses(username)")
 
     conn.commit()
     conn.close()
@@ -639,8 +667,8 @@ def get_expenses(year=None, month=None, category=None):
     conn = get_connection()
     cursor = conn.cursor()
 
-    query = "SELECT * FROM expenses WHERE 1=1"
-    params = []
+    query = "SELECT * FROM expenses WHERE username=?"
+    params = [st.session_state.username]
 
     if category:
         query += " AND category=?"
@@ -677,11 +705,13 @@ def get_month_history(year, month):
     cursor.execute("""
         SELECT *
         FROM history
-        WHERE strftime('%Y', date)=?
+        WHERE username=?
+        AND strftime('%Y', date)=?
         AND strftime('%m', date)=?
         ORDER BY date DESC, rowid DESC
     """,
     (
+        st.session_state.username,
         str(year),
         f"{month:02d}"
     ))
@@ -708,8 +738,8 @@ def get_year_total(year=None):
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT SUM(paid_amount) FROM history WHERE strftime('%Y',date)=?",
-        (str(year),)
+        "SELECT SUM(paid_amount) FROM history WHERE username=? AND strftime('%Y',date)=?",
+        (st.session_state.username, str(year))
     )
 
     total = cursor.fetchone()[0] or 0
@@ -734,10 +764,11 @@ def get_category_month_total(category, year=None, month=None):
 
     cursor.execute("""
         SELECT SUM(paid_amount) FROM history
-        WHERE category=?
+        WHERE username=?
+        AND category=?
         AND strftime('%Y', date)=?
         AND strftime('%m', date)=?
-    """, (category, str(year), f"{month:02d}"))
+    """, (st.session_state.username, category, str(year), f"{month:02d}"))
 
     total = cursor.fetchone()[0] or 0
 
@@ -755,9 +786,10 @@ def get_expense_count_this_month(expense_id):
     cursor.execute("""
         SELECT COUNT(*) FROM history
         WHERE expense_id=?
+        AND username=?
         AND strftime('%Y', date)=?
         AND strftime('%m', date)=?
-    """, (expense_id, str(today_.year), f"{today_.month:02d}"))
+    """, (expense_id, st.session_state.username, str(today_.year), f"{today_.month:02d}"))
 
     count = cursor.fetchone()[0]
 
@@ -771,8 +803,8 @@ def find_expense_in_category(category, desc):
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT * FROM expenses WHERE category=? AND LOWER(TRIM(desc))=?",
-        (category, desc.strip().lower())
+        "SELECT * FROM expenses WHERE username=? AND category=? AND LOWER(TRIM(desc))=?",
+        (st.session_state.username, category, desc.strip().lower())
     )
 
     row = cursor.fetchone()
@@ -790,14 +822,15 @@ def add_expense(category, desc, amount, exp_date, count=1):
 
     cursor.execute("""
         INSERT INTO expenses
-        VALUES(?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?)
             """,(
             expense_id,
             category,
             desc,
             amount,
             exp_date.strftime("%Y-%m-%d"),
-            count
+            count,
+            st.session_state.username
 ))
 
     conn.commit()
@@ -811,7 +844,8 @@ def add_history(expense_id, category, desc, paid_amount, purchase_date):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""INSERT INTO history VALUES(?,?,?,?,?,?)""", (str(uuid.uuid4()),expense_id,category,desc,paid_amount,purchase_date.strftime("%Y-%m-%d") ))
+    cursor.execute("""INSERT INTO history VALUES(?,?,?,?,?,?,?)""",
+                   (str(uuid.uuid4()),expense_id,category,desc,paid_amount,purchase_date.strftime("%Y-%m-%d"),st.session_state.username))
 
     conn.commit()
     conn.close()
@@ -823,8 +857,8 @@ def delete_template_only(exp_id):
     cursor = conn.cursor()
 
     cursor.execute(
-        "DELETE FROM expenses WHERE id=?",
-        (exp_id,)
+        "DELETE FROM expenses WHERE id=? AND username=?",
+        (exp_id, st.session_state.username)
     )
 
     conn.commit()
@@ -837,13 +871,13 @@ def delete_template_with_history(exp_id):
     cursor = conn.cursor()
 
     cursor.execute(
-        "DELETE FROM history WHERE expense_id=?",
-        (exp_id,)
+        "DELETE FROM history WHERE expense_id=? AND username=?",
+        (exp_id, st.session_state.username)
     )
 
     cursor.execute(
-        "DELETE FROM expenses WHERE id=?",
-        (exp_id,)
+        "DELETE FROM expenses WHERE id=? AND username=?",
+        (exp_id, st.session_state.username)
     )
 
     conn.commit()
@@ -856,8 +890,8 @@ def delete_history_transaction(history_id):
     cursor = conn.cursor()
 
     cursor.execute(
-        "DELETE FROM history WHERE id=?",
-        (history_id,)
+        "DELETE FROM history WHERE id=? AND username=?",
+        (history_id, st.session_state.username)
     )
 
     conn.commit()
@@ -879,14 +913,15 @@ def edit_history_transaction(history_id, new_desc, new_category, new_amount, new
                 category=?,
                 paid_amount=?,
                 date=?
-            WHERE id=?
+            WHERE id=? AND username=?
         """,
         (
             new_desc,
             new_category,
             new_amount,
             new_date.strftime("%Y-%m-%d"),
-            history_id
+            history_id,
+            st.session_state.username
         ))
 
     conn.commit()
@@ -901,7 +936,8 @@ def all_years():
     cursor.execute("""
     SELECT DISTINCT strftime('%Y',date)
     FROM expenses
-    """)
+    WHERE username=?
+    """, (st.session_state.username,))
 
     years = [int(r[0]) for r in cursor.fetchall()]
 
@@ -996,6 +1032,47 @@ def render_stat_card(label, value, subtitle=None, gradient=None, bordered=True):
 # ----------------------------------------------------------------------
 # LOGIN SCREEN
 # ----------------------------------------------------------------------
+def _start_session(username):
+    token = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO sessions(token, username, created_at) VALUES(?,?,?)",
+                    (token, username, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    st.session_state.logged_in = True
+    st.session_state.username = username
+    st.query_params["token"] = token
+
+
+def _end_session():
+    token = st.query_params.get("token")
+    if token:
+        conn = get_connection()
+        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+        conn.commit()
+        conn.close()
+    st.query_params.clear()
+    st.session_state.logged_in = False
+    st.session_state.username = None
+
+
+def _restore_session():
+    """Auto log-in from a token in the URL, so refreshing/reopening the
+    app doesn't require logging in again."""
+    if st.session_state.logged_in:
+        return
+    token = st.query_params.get("token")
+    if not token:
+        return
+    conn = get_connection()
+    row = conn.execute("SELECT username FROM sessions WHERE token=?", (token,)).fetchone()
+    conn.close()
+    if row:
+        st.session_state.logged_in = True
+        st.session_state.username = row["username"]
+
+
 def login_screen():
     st.write("")
     st.markdown(
@@ -1009,41 +1086,43 @@ def login_screen():
         tab_login, tab_signup = st.tabs(["Log In", "Sign Up"])
 
         with tab_login:
-            username = st.text_input("Username", key="login_user")
+            email = st.text_input("Email", key="login_email")
             password = st.text_input("Password", type="password", key="login_pass")
             if st.button("Log In", width="stretch", type="primary"):
                 conn = get_connection()
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM users WHERE username=?",(username,))
+                cursor.execute("SELECT * FROM users WHERE email=?", (email.strip().lower(),))
                 user = cursor.fetchone()
                 conn.close()
                 if user and user["password"] == password:
-                    st.session_state.logged_in = True
-                    st.session_state.username = username
+                    _start_session(user["username"])
                     st.rerun()
                 else:
-                    st.error("Invalid username or password.")
-            st.caption("Demo account — username: `admin`, password: `admin123`")
+                    st.error("Invalid email or password.")
 
         with tab_signup:
+            new_email = st.text_input("Email", key="signup_email")
             new_user = st.text_input("Choose a username", key="signup_user")
             new_pass = st.text_input("Choose a password", type="password", key="signup_pass")
             if st.button("Create Account", width="stretch", type="primary"):
-                if not new_user or not new_pass:
-                    st.error("Please fill in both fields.")
+                if not new_email or not new_user or not new_pass:
+                    st.error("Please fill in all fields.")
                 else:
+                    email_clean = new_email.strip().lower()
                     conn = get_connection()
                     cursor = conn.cursor()
-                    cursor.execute("SELECT * FROM users WHERE username=?",(new_user,))
+                    cursor.execute("SELECT * FROM users WHERE username=? OR email=?", (new_user, email_clean))
                     existing = cursor.fetchone()
                     if existing:
-                        st.error("Username already exists.")
+                        st.error("Username or email already in use.")
+                        conn.close()
                     else:
-                        cursor.execute("INSERT INTO users(username, password) VALUES(?, ?)",
-                        (new_user, new_pass))
+                        cursor.execute("INSERT INTO users(username, password, email) VALUES(?, ?, ?)",
+                                        (new_user, new_pass, email_clean))
                         conn.commit()
-                        st.success("Account created! Please log in.")
-                    conn.close()
+                        conn.close()
+                        _start_session(new_user)
+                        st.rerun()
 
 
 # ----------------------------------------------------------------------
@@ -1283,8 +1362,8 @@ def category_detail_view(category):
                         conn = get_connection()
                         cursor = conn.cursor()
                         cursor.execute(
-                            "UPDATE expenses SET date=? WHERE id=?",
-                            (date.today().strftime("%Y-%m-%d"), e["id"])
+                            "UPDATE expenses SET date=? WHERE id=? AND username=?",
+                            (date.today().strftime("%Y-%m-%d"), e["id"], st.session_state.username)
                         )
                         conn.commit()
                         conn.close()
@@ -1313,8 +1392,8 @@ def category_detail_view(category):
                             conn = get_connection()
                             cursor = conn.cursor()
                             cursor.execute(
-                                "UPDATE expenses SET date=? WHERE id=?",
-                                (new_date.strftime("%Y-%m-%d"), e["id"])
+                                "UPDATE expenses SET date=? WHERE id=? AND username=?",
+                                (new_date.strftime("%Y-%m-%d"), e["id"], st.session_state.username)
                             )
                             conn.commit()
                             conn.close()
@@ -1566,7 +1645,7 @@ def profile_page():
         st.markdown("<div class='app-section-title'>Download Data</div>", unsafe_allow_html=True)
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM expenses")
+        cursor.execute("SELECT * FROM expenses WHERE username=?", (st.session_state.username,))
         expenses = [dict(row) for row in cursor.fetchall()]
         conn.close()
 
@@ -1601,8 +1680,8 @@ def profile_page():
             if st.button("Reset All Data", icon=":material/delete_forever:", disabled=not confirm, width="stretch"):
                 conn = get_connection()
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM expenses")
-                cursor.execute("DELETE FROM history")
+                cursor.execute("DELETE FROM expenses WHERE username=?", (st.session_state.username,))
+                cursor.execute("DELETE FROM history WHERE username=?", (st.session_state.username,))
                 conn.commit()
                 conn.close()
                 queue_toast("All data reset.", "🗑️")
@@ -1610,8 +1689,7 @@ def profile_page():
 
         st.divider()
         if st.button("Log Out", icon=":material/logout:", width="stretch"):
-            st.session_state.logged_in = False
-            st.session_state.username = None
+            _end_session()
             st.session_state.page = "Home"
             st.session_state.selected_category = None
             st.session_state.selected_year = None
@@ -1623,6 +1701,7 @@ def profile_page():
 # MAIN APP FLOW
 # ----------------------------------------------------------------------
 def main():
+    _restore_session()
     if not st.session_state.logged_in:
         login_screen()
         return
