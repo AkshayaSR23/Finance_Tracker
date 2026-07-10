@@ -2,4 +2,5 @@ myenv/
 __pycache__/
 *.pyc
 .vscode/
-*.db
+.streamlit/secrets.toml
+finance1.db

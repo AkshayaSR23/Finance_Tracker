@@ -35,20 +35,11 @@ def initialize_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users(
             username TEXT PRIMARY KEY,
-            password TEXT
-        )
-    """)
-
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already exists
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions(
-            token TEXT PRIMARY KEY,
-            username TEXT,
-            created_at TEXT
+            email TEXT,
+            budget REAL DEFAULT 5000,
+            google_id TEXT,
+            name TEXT,
+            picture TEXT
         )
     """)
 
@@ -84,19 +75,6 @@ def initialize_database():
         cursor.execute("DELETE FROM expenses")
         cursor.execute("ALTER TABLE expenses ADD COLUMN username TEXT")
         cursor.execute("ALTER TABLE history ADD COLUMN username TEXT")
-
-    cursor.execute("""
-        INSERT OR IGNORE INTO users(username,password)
-        VALUES('admin','admin123')
-    """)
-    cursor.execute("UPDATE users SET email='admin@example.com' WHERE username='admin' AND (email IS NULL OR email='')")
-
-    # Per-user editable monthly budget — added as a column on the
-    # existing users table (no new table), persists across sessions.
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN budget REAL DEFAULT 5000")
-    except sqlite3.OperationalError:
-        pass  # column already exists
 
     # NEW: indexes so History lookups (by expense, date, category)
     # stay fast as the table grows — no schema/behavior change, just
@@ -644,6 +622,36 @@ def get_user(username):
     return user
 
 
+def get_or_create_google_user(google_user):
+    """Ensure a local `users` row exists for this Google account, and
+    return the `username` string the rest of the app should use.
+    Using the Google email as the username means every existing
+    function (get_expenses, add_expense, budgets, etc.) needs zero
+    changes — they only ever cared about a username string."""
+    email = google_user["email"].strip().lower()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username=?", (email,))
+    user = cursor.fetchone()
+    if user is None:
+        cursor.execute(
+            "INSERT INTO users(username, email, google_id, name, picture) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (email, email, google_user.get("sub"),
+             google_user.get("name"), google_user.get("picture")),
+        )
+    else:
+        # Keep name/avatar fresh in case they change on Google's side.
+        cursor.execute(
+            "UPDATE users SET google_id=?, name=?, picture=? WHERE username=?",
+            (google_user.get("sub"), google_user.get("name"),
+             google_user.get("picture"), email),
+        )
+    conn.commit()
+    conn.close()
+    return email
+
+
 def get_user_budget(username):
     user = get_user(username)
     if user is None or user["budget"] is None:
@@ -1032,97 +1040,20 @@ def render_stat_card(label, value, subtitle=None, gradient=None, bordered=True):
 # ----------------------------------------------------------------------
 # LOGIN SCREEN
 # ----------------------------------------------------------------------
-def _start_session(username):
-    token = str(uuid.uuid4())
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO sessions(token, username, created_at) VALUES(?,?,?)",
-                    (token, username, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-    st.session_state.logged_in = True
-    st.session_state.username = username
-    st.query_params["token"] = token
-
-
-def _end_session():
-    token = st.query_params.get("token")
-    if token:
-        conn = get_connection()
-        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
-        conn.commit()
-        conn.close()
-    st.query_params.clear()
-    st.session_state.logged_in = False
-    st.session_state.username = None
-
-
-def _restore_session():
-    """Auto log-in from a token in the URL, so refreshing/reopening the
-    app doesn't require logging in again."""
-    if st.session_state.logged_in:
-        return
-    token = st.query_params.get("token")
-    if not token:
-        return
-    conn = get_connection()
-    row = conn.execute("SELECT username FROM sessions WHERE token=?", (token,)).fetchone()
-    conn.close()
-    if row:
-        st.session_state.logged_in = True
-        st.session_state.username = row["username"]
-
-
 def login_screen():
     st.write("")
     st.markdown(
         "<h1 style='text-align:center;'>💰 Finance Tracker</h1>"
-        "<p style='text-align:center;opacity:0.8;'>.</p>",
+        "<p style='text-align:center;opacity:0.8;'>    </p>",
         unsafe_allow_html=True
     )
     st.write("")
 
     with st.container(key="login_card"):
-        tab_login, tab_signup = st.tabs(["Log In", "Sign Up"])
-
-        with tab_login:
-            email = st.text_input("Email", key="login_email")
-            password = st.text_input("Password", type="password", key="login_pass")
-            if st.button("Log In", width="stretch", type="primary"):
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("SELECT * FROM users WHERE email=?", (email.strip().lower(),))
-                user = cursor.fetchone()
-                conn.close()
-                if user and user["password"] == password:
-                    _start_session(user["username"])
-                    st.rerun()
-                else:
-                    st.error("Invalid email or password.")
-
-        with tab_signup:
-            new_email = st.text_input("Email", key="signup_email")
-            new_user = st.text_input("Choose a username", key="signup_user")
-            new_pass = st.text_input("Choose a password", type="password", key="signup_pass")
-            if st.button("Create Account", width="stretch", type="primary"):
-                if not new_email or not new_user or not new_pass:
-                    st.error("Please fill in all fields.")
-                else:
-                    email_clean = new_email.strip().lower()
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT * FROM users WHERE username=? OR email=?", (new_user, email_clean))
-                    existing = cursor.fetchone()
-                    if existing:
-                        st.error("Username or email already in use.")
-                        conn.close()
-                    else:
-                        cursor.execute("INSERT INTO users(username, password, email) VALUES(?, ?, ?)",
-                                        (new_user, new_pass, email_clean))
-                        conn.commit()
-                        conn.close()
-                        _start_session(new_user)
-                        st.rerun()
+        st.write("")
+        if st.button("Continue with Google", icon=":material/login:",
+                     width="stretch", type="primary"):
+            st.login("google")
 
 
 # ----------------------------------------------------------------------
@@ -1132,8 +1063,9 @@ def render_header():
     with st.container(key="app_header"):
         col_text, col_btn = st.columns([8, 1.4], vertical_alignment="center")
         with col_text:
+            display_name = st.user.get("name") or st.session_state.username.title()
             st.markdown(
-                f"<div class='app-page-title'>{st.session_state.username.title()}! 👋</div>"
+                f"<div class='app-page-title'>{display_name}</div>"
                 f"<div class='row-sub'>{date.today().strftime('%A, %d %B %Y')}</div>",
                 unsafe_allow_html=True
             )
@@ -1626,7 +1558,8 @@ def profile_page():
 
     with st.container(key="profile_card"):
         st.markdown("<div class='app-page-title'>👤 Profile</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='row-sub'>Username: {st.session_state.username}</div>", unsafe_allow_html=True)
+        display_name = st.user.get("name") or st.session_state.username.title()
+        st.markdown(f"<div class='row-sub'>{display_name} · {st.session_state.username}</div>", unsafe_allow_html=True)
         st.divider()
 
         st.markdown("<div class='app-section-title'>Monthly Budget</div>", unsafe_allow_html=True)
@@ -1689,22 +1622,26 @@ def profile_page():
 
         st.divider()
         if st.button("Log Out", icon=":material/logout:", width="stretch"):
-            _end_session()
             st.session_state.page = "Home"
             st.session_state.selected_category = None
             st.session_state.selected_year = None
             st.session_state.expanded_month = None
-            st.rerun()
+            st.session_state.logged_in = False
+            st.session_state.username = None
+            st.logout()
 
 
 # ----------------------------------------------------------------------
 # MAIN APP FLOW
 # ----------------------------------------------------------------------
 def main():
-    _restore_session()
-    if not st.session_state.logged_in:
+    if not st.user.is_logged_in:
         login_screen()
         return
+
+    if not st.session_state.logged_in:
+        st.session_state.username = get_or_create_google_user(st.user)
+        st.session_state.logged_in = True
 
     if st.session_state.show_add_expense:
         flush_toast()
