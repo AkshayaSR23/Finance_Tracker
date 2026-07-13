@@ -1,0 +1,7 @@
+myenv/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.db
+finance1.db
