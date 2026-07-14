@@ -1595,7 +1595,7 @@ def profile_page():
             import csv
             import io
             buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=["id", "category", "desc", "amount", "count", "date"])
+            writer = csv.DictWriter(buf, fieldnames=["id", "category", "desc", "amount", "count", "date","username"])
             writer.writeheader()
             writer.writerows(expenses)
             st.download_button(
