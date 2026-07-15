@@ -10,21 +10,61 @@ import os
 import uuid
 import calendar
 from datetime import datetime, date
-import sqlite3
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
 
 # ----------------------------------------------------------------------
 # CONFIG / CONSTANTS
 # ----------------------------------------------------------------------
-DB_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "finance1.db"
-)
+# Connection string comes from Neon (see secrets.toml), never a local file.
+DATABASE_URL = st.secrets["neon"]["database_url"]
+
+
+@st.cache_resource
+def get_pool():
+    """A small pool of already-open connections to Neon, created once and
+    reused for the lifetime of the app. Without this, every get_connection()
+    call would pay the full cost of a fresh network handshake to Neon's
+    server (in Singapore) — the pool avoids that by keeping connections
+    open and handing them out/back as needed.
+
+    Kept small (a handful, not dozens) since this app is used by one
+    person — but NOT set to exactly 1: Streamlit can briefly run two
+    script executions back-to-back (e.g. a quick second click before the
+    first rerun finishes), and with zero spare capacity that instantly
+    exhausts the pool. A small buffer costs nothing extra — Neon bills
+    for active query time, not for how many idle connections are held —
+    so there's no downside to a bit of headroom here."""
+    return psycopg2.pool.ThreadedConnectionPool(
+        1, 5, DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor
+    )
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
+    """Borrow a connection from the pool. Before handing it back, do a
+    cheap health check (SELECT 1). If the app has been idle long enough
+    that Neon's compute went to sleep and later closed out old sessions,
+    the pooled connection may be dead even though it looks fine to us —
+    this catches that and transparently swaps in a fresh one (a new
+    handshake), rather than surfacing a confusing error deep inside
+    whatever query happens to run first after waking up."""
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        probe = conn.cursor()
+        probe.execute("SELECT 1")
+        probe.close()
+    except Exception:
+        pool.putconn(conn, close=True)
+        conn = pool.getconn()
     return conn
+
+
+def release_connection(conn):
+    """Return a connection to the pool instead of closing it outright,
+    so it can be reused by the next query."""
+    get_pool().putconn(conn)
 
 
 @st.cache_resource
@@ -47,7 +87,7 @@ def initialize_database():
         CREATE TABLE IF NOT EXISTS expenses(
             id TEXT PRIMARY KEY,
             category TEXT,
-            desc TEXT,
+            "desc" TEXT,
             amount REAL,
             date TEXT,
             count INTEGER
@@ -59,7 +99,7 @@ def initialize_database():
             id TEXT PRIMARY KEY,
             expense_id TEXT,
             category TEXT,
-            desc TEXT,
+            "desc" TEXT,
             paid_amount REAL,
             date TEXT
         )
@@ -69,8 +109,12 @@ def initialize_database():
     # user. One-time cleanup: old rows predate this and were test data,
     # so we clear them out instead of migrating (clean slate, not tied
     # to any account).
-    cursor.execute("PRAGMA table_info(expenses)")
-    if "username" not in [r[1] for r in cursor.fetchall()]:
+    cursor.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'expenses'
+    """)
+    existing_cols = [r["column_name"] for r in cursor.fetchall()]
+    if "username" not in existing_cols:
         cursor.execute("DELETE FROM history")
         cursor.execute("DELETE FROM expenses")
         cursor.execute("ALTER TABLE expenses ADD COLUMN username TEXT")
@@ -86,7 +130,7 @@ def initialize_database():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_expenses_username ON expenses(username)")
 
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
 
 initialize_database()
@@ -392,8 +436,20 @@ def apply_theme():
         background:transparent !important;
         color:#12A6BA !important;
     }
+    .st-key-home_nav_container, .st-key-history_nav_container{
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        width:100%;
+    }
 
     /* ---------- Center FAB ("+" button) ---------- */
+    .st-key-fab_container{
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        width:100%;
+    }
     .st-key-fab_container button{
         background:#22C55E !important;
         color:white !important;
@@ -616,9 +672,9 @@ apply_theme()
 def get_user(username):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE username=?", (username,))
+    cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
     user = cursor.fetchone()
-    conn.close()
+    release_connection(conn)
     return user
 
 
@@ -631,24 +687,24 @@ def get_or_create_google_user(google_user):
     email = google_user["email"].strip().lower()
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE username=?", (email,))
+    cursor.execute("SELECT * FROM users WHERE username=%s", (email,))
     user = cursor.fetchone()
     if user is None:
         cursor.execute(
             "INSERT INTO users(username, email, google_id, name, picture) "
-            "VALUES(?, ?, ?, ?, ?)",
+            "VALUES(%s, %s, %s, %s, %s)",
             (email, email, google_user.get("sub"),
              google_user.get("name"), google_user.get("picture")),
         )
     else:
         # Keep name/avatar fresh in case they change on Google's side.
         cursor.execute(
-            "UPDATE users SET google_id=?, name=?, picture=? WHERE username=?",
+            "UPDATE users SET google_id=%s, name=%s, picture=%s WHERE username=%s",
             (google_user.get("sub"), google_user.get("name"),
              google_user.get("picture"), email),
         )
     conn.commit()
-    conn.close()
+    release_connection(conn)
     return email
 
 
@@ -662,9 +718,9 @@ def get_user_budget(username):
 def set_user_budget(username, new_budget):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET budget=? WHERE username=?", (new_budget, username))
+    cursor.execute("UPDATE users SET budget=%s WHERE username=%s", (new_budget, username))
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
 
 # ----------------------------------------------------------------------
@@ -675,19 +731,19 @@ def get_expenses(year=None, month=None, category=None):
     conn = get_connection()
     cursor = conn.cursor()
 
-    query = "SELECT * FROM expenses WHERE username=?"
+    query = "SELECT * FROM expenses WHERE username=%s"
     params = [st.session_state.username]
 
     if category:
-        query += " AND category=?"
+        query += " AND category=%s"
         params.append(category)
 
     if year:
-        query += " AND strftime('%Y', date)=?"
+        query += " AND TO_CHAR(date::date, 'YYYY')=%s"
         params.append(str(year))
 
     if month:
-        query += " AND strftime('%m', date)=?"
+        query += " AND TO_CHAR(date::date, 'MM')=%s"
         params.append(f"{month:02d}")
 
     query += " ORDER BY date DESC"
@@ -696,7 +752,7 @@ def get_expenses(year=None, month=None, category=None):
 
     expenses = cursor.fetchall()
 
-    conn.close()
+    release_connection(conn)
 
     return expenses
 
@@ -713,10 +769,10 @@ def get_month_history(year, month):
     cursor.execute("""
         SELECT *
         FROM history
-        WHERE username=?
-        AND strftime('%Y', date)=?
-        AND strftime('%m', date)=?
-        ORDER BY date DESC, rowid DESC
+        WHERE username=%s
+        AND TO_CHAR(date::date, 'YYYY')=%s
+        AND TO_CHAR(date::date, 'MM')=%s
+        ORDER BY date DESC
     """,
     (
         st.session_state.username,
@@ -726,7 +782,7 @@ def get_month_history(year, month):
 
     rows = cursor.fetchall()
 
-    conn.close()
+    release_connection(conn)
 
     return rows
 
@@ -746,13 +802,14 @@ def get_year_total(year=None):
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT SUM(paid_amount) FROM history WHERE username=? AND strftime('%Y',date)=?",
+        "SELECT SUM(paid_amount) AS total FROM history WHERE username=%s AND TO_CHAR(date::date, 'YYYY')=%s",
         (st.session_state.username, str(year))
     )
 
-    total = cursor.fetchone()[0] or 0
+    row = cursor.fetchone()
+    total = (row["total"] if row else None) or 0
 
-    conn.close()
+    release_connection(conn)
 
     return total
 
@@ -771,18 +828,45 @@ def get_category_month_total(category, year=None, month=None):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT SUM(paid_amount) FROM history
-        WHERE username=?
-        AND category=?
-        AND strftime('%Y', date)=?
-        AND strftime('%m', date)=?
+        SELECT SUM(paid_amount) AS total FROM history
+        WHERE username=%s
+        AND category=%s
+        AND TO_CHAR(date::date, 'YYYY')=%s
+        AND TO_CHAR(date::date, 'MM')=%s
     """, (st.session_state.username, category, str(year), f"{month:02d}"))
 
-    total = cursor.fetchone()[0] or 0
+    row = cursor.fetchone()
+    total = (row["total"] if row else None) or 0
 
-    conn.close()
+    release_connection(conn)
 
     return total
+
+
+def get_all_category_month_totals(year=None, month=None):
+    """Same result as calling get_category_month_total() once per category,
+    but as a single grouped query — one connection/round-trip instead of
+    one per category. Returns a dict: {category: total}."""
+    today_ = date.today()
+    year = year or today_.year
+    month = month or today_.month
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT category, SUM(paid_amount) AS total FROM history
+        WHERE username=%s
+        AND TO_CHAR(date::date, 'YYYY')=%s
+        AND TO_CHAR(date::date, 'MM')=%s
+        GROUP BY category
+    """, (st.session_state.username, str(year), f"{month:02d}"))
+
+    totals = {row["category"]: row["total"] for row in cursor.fetchall()}
+
+    release_connection(conn)
+
+    return totals
 
 
 def get_expense_count_this_month(expense_id):
@@ -792,16 +876,17 @@ def get_expense_count_this_month(expense_id):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT COUNT(*) FROM history
-        WHERE expense_id=?
-        AND username=?
-        AND strftime('%Y', date)=?
-        AND strftime('%m', date)=?
+        SELECT COUNT(*) AS total FROM history
+        WHERE expense_id=%s
+        AND username=%s
+        AND TO_CHAR(date::date, 'YYYY')=%s
+        AND TO_CHAR(date::date, 'MM')=%s
     """, (expense_id, st.session_state.username, str(today_.year), f"{today_.month:02d}"))
 
-    count = cursor.fetchone()[0]
+    row = cursor.fetchone()
+    count = row["total"] if row else 0
 
-    conn.close()
+    release_connection(conn)
 
     return count
 
@@ -811,13 +896,13 @@ def find_expense_in_category(category, desc):
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT * FROM expenses WHERE username=? AND category=? AND LOWER(TRIM(desc))=?",
+        "SELECT * FROM expenses WHERE username=%s AND category=%s AND LOWER(TRIM(\"desc\"))=%s",
         (st.session_state.username, category, desc.strip().lower())
     )
 
     row = cursor.fetchone()
 
-    conn.close()
+    release_connection(conn)
 
     return row
 
@@ -830,7 +915,7 @@ def add_expense(category, desc, amount, exp_date, count=1):
 
     cursor.execute("""
         INSERT INTO expenses
-        VALUES(?,?,?,?,?,?,?)
+        VALUES(%s,%s,%s,%s,%s,%s,%s)
             """,(
             expense_id,
             category,
@@ -842,7 +927,7 @@ def add_expense(category, desc, amount, exp_date, count=1):
 ))
 
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
     return expense_id
 
@@ -852,11 +937,11 @@ def add_history(expense_id, category, desc, paid_amount, purchase_date):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""INSERT INTO history VALUES(?,?,?,?,?,?,?)""",
+    cursor.execute("""INSERT INTO history VALUES(%s,%s,%s,%s,%s,%s,%s)""",
                    (str(uuid.uuid4()),expense_id,category,desc,paid_amount,purchase_date.strftime("%Y-%m-%d"),st.session_state.username))
 
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
 
 def delete_template_only(exp_id):
@@ -865,12 +950,12 @@ def delete_template_only(exp_id):
     cursor = conn.cursor()
 
     cursor.execute(
-        "DELETE FROM expenses WHERE id=? AND username=?",
+        "DELETE FROM expenses WHERE id=%s AND username=%s",
         (exp_id, st.session_state.username)
     )
 
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
 
 def delete_template_with_history(exp_id):
@@ -879,17 +964,17 @@ def delete_template_with_history(exp_id):
     cursor = conn.cursor()
 
     cursor.execute(
-        "DELETE FROM history WHERE expense_id=? AND username=?",
+        "DELETE FROM history WHERE expense_id=%s AND username=%s",
         (exp_id, st.session_state.username)
     )
 
     cursor.execute(
-        "DELETE FROM expenses WHERE id=? AND username=?",
+        "DELETE FROM expenses WHERE id=%s AND username=%s",
         (exp_id, st.session_state.username)
     )
 
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
 
 def delete_history_transaction(history_id):
@@ -898,12 +983,12 @@ def delete_history_transaction(history_id):
     cursor = conn.cursor()
 
     cursor.execute(
-        "DELETE FROM history WHERE id=? AND username=?",
+        "DELETE FROM history WHERE id=%s AND username=%s",
         (history_id, st.session_state.username)
     )
 
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
 
 def edit_history_transaction(history_id, new_desc, new_category, new_amount, new_date):
@@ -917,11 +1002,11 @@ def edit_history_transaction(history_id, new_desc, new_category, new_amount, new
     cursor.execute("""
             UPDATE history
             SET
-                desc=?,
-                category=?,
-                paid_amount=?,
-                date=?
-            WHERE id=? AND username=?
+                "desc"=%s,
+                category=%s,
+                paid_amount=%s,
+                date=%s
+            WHERE id=%s AND username=%s
         """,
         (
             new_desc,
@@ -933,7 +1018,7 @@ def edit_history_transaction(history_id, new_desc, new_category, new_amount, new
         ))
 
     conn.commit()
-    conn.close()
+    release_connection(conn)
 
 
 def all_years():
@@ -942,14 +1027,14 @@ def all_years():
     cursor = conn.cursor()
 
     cursor.execute("""
-    SELECT DISTINCT strftime('%Y',date)
+    SELECT DISTINCT TO_CHAR(date::date, 'YYYY') AS yr
     FROM expenses
-    WHERE username=?
+    WHERE username=%s
     """, (st.session_state.username,))
 
-    years = [int(r[0]) for r in cursor.fetchall()]
+    years = [int(r["yr"]) for r in cursor.fetchall()]
 
-    conn.close()
+    release_connection(conn)
 
     current = date.today().year
 
@@ -1088,14 +1173,15 @@ def render_bottom_nav():
         col_home, col_fab, col_hist = st.columns(3, vertical_alignment="center")
 
         with col_home:
-            if st.button(
-                "Home", icon=":material/home:", key="nav_home",
-                type="primary" if st.session_state.page == "Home" else "secondary",
-            ):
-                st.session_state.page = "Home"
-                st.session_state.selected_category = None
-                st.session_state.expanded_month = None
-                st.rerun()
+            with st.container(key="home_nav_container"):
+                if st.button(
+                    "Home", icon=":material/home:", key="nav_home",
+                    type="primary" if st.session_state.page == "Home" else "secondary",
+                ):
+                    st.session_state.page = "Home"
+                    st.session_state.selected_category = None
+                    st.session_state.expanded_month = None
+                    st.rerun()
 
         with col_fab:
             with st.container(key="fab_container"):
@@ -1109,13 +1195,14 @@ def render_bottom_nav():
                     st.rerun()
 
         with col_hist:
-            if st.button(
-                "History", icon=":material/history:", key="nav_history",
-                type="primary" if st.session_state.page == "History" else "secondary",
-            ):
-                st.session_state.page = "History"
-                st.session_state.expanded_month = None
-                st.rerun()
+            with st.container(key="history_nav_container"):
+                if st.button(
+                    "History", icon=":material/history:", key="nav_history",
+                    type="primary" if st.session_state.page == "History" else "secondary",
+                ):
+                    st.session_state.page = "History"
+                    st.session_state.expanded_month = None
+                    st.rerun()
 
 
 # ----------------------------------------------------------------------
@@ -1185,10 +1272,12 @@ def home_page():
 
     st.markdown("<div class='app-section-title'>~Categories~</div>", unsafe_allow_html=True)
 
+    all_cat_totals = get_all_category_month_totals()
+
     for cat in CATEGORIES:
         icon = CATEGORY_ICONS.get(cat, "📦")
         c = CATEGORY_COLORS.get(cat, {"accent": DEFAULT_ACCENT})
-        cat_total = get_category_month_total(cat)
+        cat_total = all_cat_totals.get(cat, 0)
 
         with st.container(border=True, key=f"catcard_{cat}"):
             # [icon] Name / "This month"  ....  ₹amount (colored)  [>]
@@ -1294,11 +1383,11 @@ def category_detail_view(category):
                         conn = get_connection()
                         cursor = conn.cursor()
                         cursor.execute(
-                            "UPDATE expenses SET date=? WHERE id=? AND username=?",
+                            "UPDATE expenses SET date=%s WHERE id=%s AND username=%s",
                             (date.today().strftime("%Y-%m-%d"), e["id"], st.session_state.username)
                         )
                         conn.commit()
-                        conn.close()
+                        release_connection(conn)
                         add_history(e["id"], e["category"], e["desc"], e["amount"], date.today())
                         queue_toast("Added at default amount.")
                         st.rerun()
@@ -1324,11 +1413,11 @@ def category_detail_view(category):
                             conn = get_connection()
                             cursor = conn.cursor()
                             cursor.execute(
-                                "UPDATE expenses SET date=? WHERE id=? AND username=?",
+                                "UPDATE expenses SET date=%s WHERE id=%s AND username=%s",
                                 (new_date.strftime("%Y-%m-%d"), e["id"], st.session_state.username)
                             )
                             conn.commit()
-                            conn.close()
+                            release_connection(conn)
                             add_history(e["id"], e["category"], e["desc"], new_amount, new_date)
                             st.session_state.category_action = {"type": None, "id": None}
                             queue_toast("Custom purchase recorded.")
@@ -1578,9 +1667,9 @@ def profile_page():
         st.markdown("<div class='app-section-title'>Download Data</div>", unsafe_allow_html=True)
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM expenses WHERE username=?", (st.session_state.username,))
+        cursor.execute("SELECT * FROM expenses WHERE username=%s", (st.session_state.username,))
         expenses = [dict(row) for row in cursor.fetchall()]
-        conn.close()
+        release_connection(conn)
 
         json_str = json.dumps(expenses, indent=2)
         st.download_button(
@@ -1595,7 +1684,7 @@ def profile_page():
             import csv
             import io
             buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=["id", "category", "desc", "amount", "count", "date","username"])
+            writer = csv.DictWriter(buf, fieldnames=["id", "category", "desc", "amount", "count", "date", "username"])
             writer.writeheader()
             writer.writerows(expenses)
             st.download_button(
@@ -1613,10 +1702,10 @@ def profile_page():
             if st.button("Reset All Data", icon=":material/delete_forever:", disabled=not confirm, width="stretch"):
                 conn = get_connection()
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM expenses WHERE username=?", (st.session_state.username,))
-                cursor.execute("DELETE FROM history WHERE username=?", (st.session_state.username,))
+                cursor.execute("DELETE FROM expenses WHERE username=%s", (st.session_state.username,))
+                cursor.execute("DELETE FROM history WHERE username=%s", (st.session_state.username,))
                 conn.commit()
-                conn.close()
+                release_connection(conn)
                 queue_toast("All data reset.", "🗑️")
                 st.rerun()
 
