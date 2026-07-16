@@ -787,6 +787,36 @@ def get_month_history(year, month):
     return rows
 
 
+def get_year_history(year):
+    """Fetch every history row for the whole year in a single query.
+    Used to derive active months, month totals, category totals, and the
+    busiest month all from one in-memory dataset — instead of the old
+    pattern of querying separately per month (12+ round trips) and then
+    querying AGAIN for totals and category breakdowns on top of that."""
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM history
+        WHERE username=%s
+        AND TO_CHAR(date::date, 'YYYY')=%s
+        ORDER BY date DESC
+    """, (st.session_state.username, str(year)))
+
+    rows = cursor.fetchall()
+
+    release_connection(conn)
+
+    by_month = {}
+    for row in rows:
+        m = int(row["date"][5:7])
+        by_month.setdefault(m, []).append(row)
+
+    return by_month
+
+
 def month_total(year, month):
 
     history = get_month_history(year, month)
@@ -1462,8 +1492,9 @@ def _confirm_delete_history(history_id, desc):
 
 
 def _find_history(year, history_id):
-    for m in range(1, 13):
-        for r in get_month_history(year, m):
+    year_data = get_year_history(year)
+    for rows in year_data.values():
+        for r in rows:
             if r["id"] == history_id:
                 return r
     return None
@@ -1501,26 +1532,28 @@ def history_page():
 def _history_fragment(year):
     flush_toast()
 
-    active_months = [m for m in range(1, 13) if get_month_history(year, m)]
+    year_data = get_year_history(year)
+    active_months = sorted(year_data.keys())
     if not active_months:
         st.info("No transactions recorded yet this year.")
         return
 
-    _render_year_summary(year, active_months)
+    _render_year_summary(year, active_months, year_data)
 
     st.markdown("<div class='app-section-title'>Months</div>", unsafe_allow_html=True)
     for m in sorted(active_months, reverse=True):
-        _render_month_accordion(year, m)
+        _render_month_accordion(year, m, year_data.get(m, []))
 
 
-def _render_year_summary(year, active_months):
-    year_total = get_year_total(year)
+def _render_year_summary(year, active_months, year_data):
+    month_totals = {m: total_of(rows) for m, rows in year_data.items()}
+    year_total = sum(month_totals.values())
     avg = year_total / len(active_months) if active_months else 0
-    busiest = max(active_months, key=lambda mm: month_total(year, mm))
+    busiest = max(active_months, key=lambda mm: month_totals.get(mm, 0))
 
     cat_totals = {c: 0.0 for c in CATEGORIES}
-    for m in active_months:
-        for r in get_month_history(year, m):
+    for rows in year_data.values():
+        for r in rows:
             cat_totals[r["category"]] = cat_totals.get(r["category"], 0.0) + r["paid_amount"]
     top_cat = max(cat_totals, key=cat_totals.get) if any(cat_totals.values()) else "—"
     top_color = "#12A6BA"
@@ -1546,9 +1579,9 @@ def _render_year_summary(year, active_months):
         unsafe_allow_html=True)
 
 
-def _render_month_accordion(year, month):
+def _render_month_accordion(year, month, rows):
     color = MONTH_PALETTE[(month - 1) % len(MONTH_PALETTE)]
-    m_total = month_total(year, month)
+    m_total = total_of(rows)
     is_open = st.session_state.expanded_month == month
 
     with st.container(border=True, key=f"monthcard_{month}"):
@@ -1571,11 +1604,10 @@ def _render_month_accordion(year, month):
         # Inline expand/collapse — the list appears beneath this header,
         # inside the same card. No navigation, no separate page.
         if is_open:
-            _render_month_transactions(year, month)
+            _render_month_transactions(year, month, rows)
 
 
-def _render_month_transactions(year, month):
-    history = get_month_history(year, month)
+def _render_month_transactions(year, month, history):
     if not history:
         st.info("No transactions in this month.")
         return
