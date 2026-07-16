@@ -10,6 +10,7 @@ import os
 import uuid
 import calendar
 from datetime import datetime, date
+from contextlib import contextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -19,6 +20,30 @@ import psycopg2.pool
 # ----------------------------------------------------------------------
 # Connection string comes from Neon (see secrets.toml), never a local file.
 DATABASE_URL = st.secrets["neon"]["database_url"]
+
+
+@contextmanager
+def blur_loading(message="Loading..."):
+    """Full-screen blur overlay with a centered spinner + message, shown
+    for the duration of the `with` block. The previous screen stays
+    visible underneath (blurred) until the block finishes, at which
+    point the overlay is removed and the fresh content takes its place —
+    used to wrap slow database calls so the wait feels intentional
+    rather than like the app froze."""
+    placeholder = st.empty()
+    placeholder.markdown(
+        f"""<div class="blur-loading-overlay">
+            <div class="blur-loading-box">
+                <div class="blur-spinner"></div>
+                <div class="blur-loading-text">{message}</div>
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+    try:
+        yield
+    finally:
+        placeholder.empty()
 
 
 @st.cache_resource
@@ -654,6 +679,43 @@ def apply_theme():
     #MainMenu{ visibility:hidden; }
     footer{ visibility:hidden; }
 
+    /* ---------- Full-screen blur loading overlay ----------
+       Covers the whole viewport, blurs whatever's behind it (the
+       previous screen, still visible underneath during a rerun), and
+       shows a centered spinner + message. Removed the instant the
+       data it's waiting on is ready. */
+    .blur-loading-overlay{
+        position:fixed;
+        inset:0;
+        backdrop-filter:blur(6px);
+        -webkit-backdrop-filter:blur(6px);
+        background:rgba(255,255,255,0.45);
+        z-index:999999;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+    }
+    .blur-loading-box{
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        gap:14px;
+    }
+    .blur-spinner{
+        width:42px;
+        height:42px;
+        border:4px solid rgba(18,166,186,0.18);
+        border-top-color:#12A6BA;
+        border-radius:50%;
+        animation:blur-spin 0.8s linear infinite;
+    }
+    @keyframes blur-spin{ to{ transform:rotate(360deg); } }
+    .blur-loading-text{
+        font-weight:600;
+        color:#12A6BA;
+        font-size:15px;
+    }
+
     </style>
     """
     st.markdown(base_css, unsafe_allow_html=True)
@@ -1265,14 +1327,18 @@ def render_add_expense_view():
             if desc.strip() == "" or amount <= 0:
                 st.error("Please enter a valid name and amount.")
             else:
-                existing = find_expense_in_category(category, desc)
+                with blur_loading():
+                    existing = find_expense_in_category(category, desc)
+
+                    if existing:
+                        add_history(existing["id"], category, existing["desc"], amount, exp_date)
+                    else:
+                        expense_id = add_expense(category, desc.strip(), amount, exp_date)
+                        add_history(expense_id, category, desc.strip(), amount, exp_date)
 
                 if existing:
-                    add_history(existing["id"], category, existing["desc"], amount, exp_date)
                     st.warning(f"'{existing['desc']}' already exists in {category} — this purchase was added to it.")
                 else:
-                    expense_id = add_expense(category, desc.strip(), amount, exp_date)
-                    add_history(expense_id, category, desc.strip(), amount, exp_date)
                     st.success(f"'{desc.strip()}' added to {category}!")
 
     if st.button("Done", key="add_expense_done", width="stretch"):
@@ -1288,21 +1354,23 @@ def home_page():
         category_detail_view(st.session_state.selected_category)
         return
 
+    with blur_loading():
+        year_total = get_year_total()
+        budget = get_user_budget(st.session_state.username)
+        spent_this_month = get_current_month_total()
+        all_cat_totals = get_all_category_month_totals()
+
     render_stat_card(
         "Total Spent This Year",
-        f"₹{get_year_total():,.2f}",
+        f"₹{year_total:,.2f}",
         bordered=False,
     )
 
     with st.container(border=True, key="budget_card"):
         st.markdown("<div class='app-section-title'>Monthly Budget:</div>", unsafe_allow_html=True)
-        budget = get_user_budget(st.session_state.username)
-        spent_this_month = get_current_month_total()
         render_budget_bar(spent_this_month, budget, on_dark=True)
 
     st.markdown("<div class='app-section-title'>~Categories~</div>", unsafe_allow_html=True)
-
-    all_cat_totals = get_all_category_month_totals()
 
     for cat in CATEGORIES:
         icon = CATEGORY_ICONS.get(cat, "📦")
@@ -1366,8 +1434,9 @@ def category_detail_view(category):
 
     st.markdown(f"<div class='app-page-title'>📂 {category}</div>", unsafe_allow_html=True)
 
-    expenses = get_expenses(category=category)
-    category_total = get_category_month_total(category)
+    with blur_loading():
+        expenses = get_expenses(category=category)
+        category_total = get_category_month_total(category)
 
     c = CATEGORY_COLORS.get(category, {"grad": (DEFAULT_ACCENT, DEFAULT_ACCENT)})
     g0, g1 = c["grad"]
@@ -1532,7 +1601,9 @@ def history_page():
 def _history_fragment(year):
     flush_toast()
 
-    year_data = get_year_history(year)
+    with blur_loading():
+        year_data = get_year_history(year)
+
     active_months = sorted(year_data.keys())
     if not active_months:
         st.info("No transactions recorded yet this year.")
