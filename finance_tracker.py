@@ -509,6 +509,7 @@ def apply_theme():
     .st-key-month_table [data-testid="stHorizontalBlock"]{ align-items:center; }
     .tbl-cell{ font-size:15px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .tbl-amount{ font-size:15px; font-weight:700; text-align:right; }
+    .txn-meta{ font-size:13px; color:#64748B; }
     .tbl-total-label{ font-size:15px; font-weight:800; letter-spacing:0.03em; }
     .tbl-total-amount{ font-size:16px; font-weight:800; text-align:right; color:#12A6BA; }
     .tbl-divider{ border:none; border-top:2px dashed #D5DEE4; margin:6px 0; }
@@ -666,58 +667,14 @@ def apply_theme():
     }
 
     /* ---------- Phone: reflow the crushed 6-column transaction table ----------
-       On a real phone width, 6 fixed-ratio columns (Date, Description,
-       Category, Amount, edit icon, delete icon) side by side get squeezed
-       to the point of being unreadable. This wraps them into 3 readable
-       rows of 2 instead — DOM order is untouched, only how the columns
-       visually flow. */
+       On a real phone width, cramped text needs a touch more room to
+       breathe — the layout itself already stacks naturally at any width
+       now (see _render_month_transactions and category_detail_view),
+       so this is just sizing, not structural reflow hacks. */
     @media (max-width:480px){
-        .st-key-month_table [data-testid="stHorizontalBlock"]{
-            flex-wrap:wrap !important;
-            row-gap:4px;
-        }
-        .st-key-month_table [data-testid="stColumn"]{
-            min-width:0 !important;
-        }
-        /* Date + Description share row 1 */
-        .st-key-month_table [data-testid="stColumn"]:nth-child(1){ flex:1 1 38% !important; width:38% !important; }
-        .st-key-month_table [data-testid="stColumn"]:nth-child(2){ flex:1 1 62% !important; width:62% !important; }
-        /* Category + Amount share row 2 */
-        .st-key-month_table [data-testid="stColumn"]:nth-child(3){ flex:1 1 55% !important; width:55% !important; }
-        .st-key-month_table [data-testid="stColumn"]:nth-child(4){ flex:1 1 45% !important; width:45% !important; }
-        /* Edit + Delete icons share row 3 */
-        .st-key-month_table [data-testid="stColumn"]:nth-child(5){ flex:1 1 50% !important; width:50% !important; }
-        .st-key-month_table [data-testid="stColumn"]:nth-child(6){ flex:1 1 50% !important; width:50% !important; }
-
-        .tbl-cell, .tbl-amount{ font-size:13px; }
-        .table-header{ font-size:10px; }
-        .tbl-amount{ text-align:left; }
-
-        div[data-testid="stVerticalBlockBorderWrapper"]{ padding:8px 10px; }
-        .st-key-month_table .stButton>button{ width:100%; }
-
-        /* Expense row (category detail view): Name | Default | Count |
-           3 action buttons — same crushing problem, same fix: wrap into
-           2 rows instead of 1 impossibly tight one. */
-        [class*="st-key-exprow_"] [data-testid="stHorizontalBlock"]{
-            flex-wrap:wrap !important;
-            row-gap:6px;
-        }
-        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]{
-            min-width:0 !important;
-        }
-        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(1){
-            flex:1 1 100% !important; width:100% !important;
-        }
-        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2){
-            flex:1 1 34% !important; width:34% !important;
-        }
-        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(3){
-            flex:1 1 26% !important; width:26% !important;
-        }
-        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(4){
-            flex:1 1 40% !important; width:40% !important;
-        }
+        .tbl-amount{ font-size:14px; }
+        .txn-meta{ font-size:12px; }
+        div[data-testid="stVerticalBlockBorderWrapper"]{ padding:10px 12px; }
         [class*="st-key-exprow_"] .row-title{ font-size:15px; margin-bottom:2px; }
         [class*="st-key-exprow_"] .cell-value{ font-size:12.5px; }
     }
@@ -1515,21 +1472,16 @@ def category_detail_view(category):
         with st.container(border=True, key=f"exprow_{e['id']}"):
             tx_count = get_expense_count_this_month(e["id"])
 
-            # Single horizontal line: Name | Default: ₹X | Count: N | [+][Custom][🗑]
-            name_c, default_c, count_c, actions_c = st.columns(
-                [3.2, 2.4, 1.8, 3.0], vertical_alignment="center"
-            )
-            name_c.markdown(
+            st.markdown(
                 f"<div class='row-title' style='white-space:nowrap;overflow:hidden;"
-                f"text-overflow:ellipsis;'>{e['desc']}</div>",
+                f"text-overflow:ellipsis;' title='{e['desc']}'>{e['desc']}</div>",
                 unsafe_allow_html=True
             )
-            default_c.markdown(
-                f"<div class='cell-value' style='text-align:left;'>Default: ₹{e['amount']:,.0f}</div>",
-                unsafe_allow_html=True
-            )
-            count_c.markdown(
-                f"<div class='cell-value' style='text-align:left;'>Count: {tx_count}</div>",
+
+            meta_c, actions_c = st.columns([6, 4], vertical_alignment="center")
+            meta_c.markdown(
+                f"<div class='cell-value' style='text-align:left;'>"
+                f"Default: ₹{e['amount']:,.0f} · Count: {tx_count}</div>",
                 unsafe_allow_html=True
             )
             with actions_c:
@@ -1593,7 +1545,6 @@ def category_detail_view(category):
 # ----------------------------------------------------------------------
 # HISTORY PAGE  (year summary + inline accordion months)
 # ----------------------------------------------------------------------
-_TXN_COLS = [2.0, 3.0, 2.4, 1.8, 0.8, 0.8]
 
 
 @st.dialog("Delete transaction?")
@@ -1741,41 +1692,47 @@ def _render_month_transactions(year, month, history):
         return
 
     st.markdown("<hr class='tbl-divider'>", unsafe_allow_html=True)
-    with st.container(key="month_table"):
-        h = st.columns(_TXN_COLS, vertical_alignment="center")
-        h[0].markdown("<div class='table-header'>Date</div>", unsafe_allow_html=True)
-        h[1].markdown("<div class='table-header'>Description</div>", unsafe_allow_html=True)
-        h[2].markdown("<div class='table-header'>Category</div>", unsafe_allow_html=True)
-        h[3].markdown("<div class='table-header' style='text-align:right;'>Amount</div>", unsafe_allow_html=True)
 
-        total_amount = 0.0
-        for h_row in history:
-            total_amount += h_row["paid_amount"]
-            date_str = datetime.strptime(h_row["date"], "%Y-%m-%d").strftime("%d %b")
+    total_amount = 0.0
+    for h_row in history:
+        total_amount += h_row["paid_amount"]
+        date_str = datetime.strptime(h_row["date"], "%Y-%m-%d").strftime("%d %b")
+        cat_color = CATEGORY_COLORS.get(h_row["category"], {"accent": DEFAULT_ACCENT})["accent"]
 
-            c = st.columns(_TXN_COLS, vertical_alignment="center")
-            c[0].markdown(f"<div class='tbl-cell'>{date_str}</div>", unsafe_allow_html=True)
-            c[1].markdown(f"<div class='tbl-cell' title='{h_row['desc']}'>{h_row['desc']}</div>", unsafe_allow_html=True)
-            cat_color = CATEGORY_COLORS.get(h_row["category"], {"accent": DEFAULT_ACCENT})["accent"]
-            c[2].markdown(f"<div class='tbl-cell' style='color:{cat_color};font-weight:700;'>{h_row['category']}</div>", unsafe_allow_html=True)
-            c[3].markdown(f"<div class='tbl-amount'>₹{h_row['paid_amount']:,.0f}</div>", unsafe_allow_html=True)
-            if c[4].button("", icon=":material/edit:", key=f"edit_hist_{h_row['id']}", help="Edit"):
-                st.session_state.edit_history = h_row["id"]
-                st.session_state.history_delete_confirm_id = None
-                _frag_rerun()
-            if c[5].button("", icon=":material/delete:", key=f"delete_hist_{h_row['id']}", help="Delete"):
-                st.session_state.history_delete_confirm_id = h_row["id"]
-                st.session_state.edit_history = None
-                st.rerun()  # full rerun so the confirmation modal opens
+        with st.container(border=True, key=f"txncard_{h_row['id']}"):
+            top_l, top_r = st.columns([7, 3], vertical_alignment="center")
+            top_l.markdown(
+                f"<div class='row-title' style='white-space:nowrap;overflow:hidden;"
+                f"text-overflow:ellipsis;' title='{h_row['desc']}'>{h_row['desc']}</div>",
+                unsafe_allow_html=True)
+            top_r.markdown(f"<div class='tbl-amount'>₹{h_row['paid_amount']:,.0f}</div>", unsafe_allow_html=True)
 
-            # Inline edit form immediately beneath THIS transaction
-            if st.session_state.edit_history == h_row["id"]:
-                _render_inline_edit(h_row)
+            bot_l, bot_r = st.columns([7, 3], vertical_alignment="center")
+            bot_l.markdown(
+                f"<div class='txn-meta'>{date_str} · "
+                f"<span style='color:{cat_color};font-weight:700;'>{h_row['category']}</span></div>",
+                unsafe_allow_html=True)
+            with bot_r:
+                b1, b2 = st.columns(2, gap="small")
+                with b1:
+                    if st.button("", icon=":material/edit:", key=f"edit_hist_{h_row['id']}", help="Edit"):
+                        st.session_state.edit_history = h_row["id"]
+                        st.session_state.history_delete_confirm_id = None
+                        _frag_rerun()
+                with b2:
+                    if st.button("", icon=":material/delete:", key=f"delete_hist_{h_row['id']}", help="Delete"):
+                        st.session_state.history_delete_confirm_id = h_row["id"]
+                        st.session_state.edit_history = None
+                        st.rerun()  # full rerun so the confirmation modal opens
 
-        st.markdown("<hr class='tbl-divider'>", unsafe_allow_html=True)
-        t = st.columns(_TXN_COLS, vertical_alignment="center")
-        t[0].markdown("<div class='tbl-total-label'>TOTAL</div>", unsafe_allow_html=True)
-        t[3].markdown(f"<div class='tbl-total-amount'>₹{total_amount:,.0f}</div>", unsafe_allow_html=True)
+        # Inline edit form immediately beneath THIS transaction
+        if st.session_state.edit_history == h_row["id"]:
+            _render_inline_edit(h_row)
+
+    st.markdown("<hr class='tbl-divider'>", unsafe_allow_html=True)
+    tot_l, tot_r = st.columns([7, 3], vertical_alignment="center")
+    tot_l.markdown("<div class='tbl-total-label'>TOTAL</div>", unsafe_allow_html=True)
+    tot_r.markdown(f"<div class='tbl-total-amount'>₹{total_amount:,.0f}</div>", unsafe_allow_html=True)
 
 
 def _render_inline_edit(row):
