@@ -237,6 +237,23 @@ def apply_theme():
     base_css = """
     <style>
 
+    /* ---------- Force st.columns to stay side-by-side on phones ----------
+       Streamlit's own default behavior stacks st.columns vertically once
+       the screen is ~640px wide or narrower (i.e. basically every phone).
+       That's fine for generic dashboards, but every row in this app was
+       hand-designed as a compact side-by-side layout (icon + name +
+       amount + arrow, etc.) — Streamlit's fallback stacking breaks that
+       design rather than fixing it. This turns that default off
+       everywhere in this app, and lets our own truncation/ellipsis rules
+       (min-width:0 + text-overflow) handle narrow widths instead. */
+    [data-testid="stHorizontalBlock"]{
+        flex-direction:row !important;
+        flex-wrap:nowrap !important;
+    }
+    [data-testid="stColumn"]{
+        min-width:0 !important;
+    }
+
     /* ---------- Main App ---------- */
     .stApp{
         background:#F4F7F8;
@@ -250,7 +267,7 @@ def apply_theme():
     .stat-label{ font-size:14px; color:#475569; font-weight:600; }
     .stat-value{ font-size:32px; font-weight:800; line-height:1.15; margin-top:2px; letter-spacing:-0.02em; color:#0F172A; }
     .stat-sub{ font-size:14px; color:#475569; margin-top:6px; }
-    .cat-name{ font-size:17px; font-weight:700; color:#0F172A; }
+    .cat-name{ font-size:17px; font-weight:700; color:#0F172A; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .cat-sub{ font-size:14px; color:#475569; margin-top:3px; }
     .cell-value{ font-size:15px; font-weight:600; color:#334155; white-space:nowrap; text-align:right; }
     .row-title{ font-size:16px; font-weight:700; color:#0F172A; }
