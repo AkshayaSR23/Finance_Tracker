@@ -665,6 +665,63 @@ def apply_theme():
         .st-key-profile_card{ padding:20px 16px; }
     }
 
+    /* ---------- Phone: reflow the crushed 6-column transaction table ----------
+       On a real phone width, 6 fixed-ratio columns (Date, Description,
+       Category, Amount, edit icon, delete icon) side by side get squeezed
+       to the point of being unreadable. This wraps them into 3 readable
+       rows of 2 instead — DOM order is untouched, only how the columns
+       visually flow. */
+    @media (max-width:480px){
+        .st-key-month_table [data-testid="stHorizontalBlock"]{
+            flex-wrap:wrap !important;
+            row-gap:4px;
+        }
+        .st-key-month_table [data-testid="stColumn"]{
+            min-width:0 !important;
+        }
+        /* Date + Description share row 1 */
+        .st-key-month_table [data-testid="stColumn"]:nth-child(1){ flex:1 1 38% !important; width:38% !important; }
+        .st-key-month_table [data-testid="stColumn"]:nth-child(2){ flex:1 1 62% !important; width:62% !important; }
+        /* Category + Amount share row 2 */
+        .st-key-month_table [data-testid="stColumn"]:nth-child(3){ flex:1 1 55% !important; width:55% !important; }
+        .st-key-month_table [data-testid="stColumn"]:nth-child(4){ flex:1 1 45% !important; width:45% !important; }
+        /* Edit + Delete icons share row 3 */
+        .st-key-month_table [data-testid="stColumn"]:nth-child(5){ flex:1 1 50% !important; width:50% !important; }
+        .st-key-month_table [data-testid="stColumn"]:nth-child(6){ flex:1 1 50% !important; width:50% !important; }
+
+        .tbl-cell, .tbl-amount{ font-size:13px; }
+        .table-header{ font-size:10px; }
+        .tbl-amount{ text-align:left; }
+
+        div[data-testid="stVerticalBlockBorderWrapper"]{ padding:8px 10px; }
+        .st-key-month_table .stButton>button{ width:100%; }
+
+        /* Expense row (category detail view): Name | Default | Count |
+           3 action buttons — same crushing problem, same fix: wrap into
+           2 rows instead of 1 impossibly tight one. */
+        [class*="st-key-exprow_"] [data-testid="stHorizontalBlock"]{
+            flex-wrap:wrap !important;
+            row-gap:6px;
+        }
+        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]{
+            min-width:0 !important;
+        }
+        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(1){
+            flex:1 1 100% !important; width:100% !important;
+        }
+        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2){
+            flex:1 1 34% !important; width:34% !important;
+        }
+        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(3){
+            flex:1 1 26% !important; width:26% !important;
+        }
+        [class*="st-key-exprow_"] > div > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(4){
+            flex:1 1 40% !important; width:40% !important;
+        }
+        [class*="st-key-exprow_"] .row-title{ font-size:15px; margin-bottom:2px; }
+        [class*="st-key-exprow_"] .cell-value{ font-size:12.5px; }
+    }
+
     /* ---------- old left sidebar no longer used ---------- */
     section[data-testid="stSidebar"]{ display:none; }
     [data-testid="collapsedControl"]{ display:none; }
@@ -1455,7 +1512,7 @@ def category_detail_view(category):
     action = st.session_state.category_action
 
     for e in expenses:
-        with st.container(border=True):
+        with st.container(border=True, key=f"exprow_{e['id']}"):
             tx_count = get_expense_count_this_month(e["id"])
 
             # Single horizontal line: Name | Default: ₹X | Count: N | [+][Custom][🗑]
@@ -1694,7 +1751,7 @@ def _render_month_transactions(year, month, history):
         total_amount = 0.0
         for h_row in history:
             total_amount += h_row["paid_amount"]
-            date_str = datetime.strptime(h_row["date"], "%Y-%m-%d").strftime("%d %b %Y")
+            date_str = datetime.strptime(h_row["date"], "%Y-%m-%d").strftime("%d %b")
 
             c = st.columns(_TXN_COLS, vertical_alignment="center")
             c[0].markdown(f"<div class='tbl-cell'>{date_str}</div>", unsafe_allow_html=True)
